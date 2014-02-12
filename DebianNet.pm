@@ -2,6 +2,7 @@
 #
 # Copyright (C) 1995, 1996 Peter Tobias <tobias@et-inf.fho-emden.de>
 #                          Ian Jackson <iwj10@cus.cam.ac.uk>
+# Copyright (C) 2009-2012  Serafeim Zanikolas <sez@debian.org>
 #
 #
 # DebianNet::add_service($newentry, $group);
@@ -15,8 +16,44 @@ package DebianNet;
 require 5.6.1;
 
 use Debconf::Client::ConfModule ':all';
-use File::Temp qw/ tempfile /;
-use File::Copy qw/ move /;
+
+BEGIN {
+    eval 'use File::Temp qw/ tempfile /';
+    if ($@) {
+        # If perl-base and perl-modules are out of sync, fall back to the
+        # external 'tempfile' command.  In this case we don't bother trying
+        # to mangle the template we're given into something that tempfile
+        # can understand.
+        sub tempfile {
+            open my $tempfile_fh, '-|', 'tempfile'
+                or die "Error running tempfile: $!";
+            chomp (my $tempfile_name = <$tempfile_fh>);
+            unless (length $tempfile_name) {
+                die "tempfile did not return a temporary file name";
+            }
+            unless (close $tempfile_fh) {
+                if ($!) {
+                    die "Error closing tempfile pipe: $!";
+                } else {
+                    die "tempfile returned exit status $?";
+                }
+            }
+            open my $fh, '+<', $tempfile_name
+                or die "Error opening temporary file $tempfile_name: $!";
+            return ($fh, $tempfile_name);
+        }
+    }
+
+    eval 'use File::Copy qw/ move /';
+    if ($@) {
+        # If perl-base and perl-modules are out of sync, fall back to the
+        # external 'mv' command.
+        sub move {
+            my ($from, $to) = @_;
+            return system('mv', $from, $to) == 0;
+        }
+    }
+}
 
 $inetdcf="/etc/inetd.conf";
 $sep = "#<off># ";
@@ -142,16 +179,16 @@ sub add_service {
 }
 
 sub remove_service {
-    my($service) = @_;
-    unless(defined($service)) { return(-1) };
+    my($service, $pattern) = @_;
     chomp($service);
     my $nlines_removed = 0;
     if($service eq "") {
          print STDERR "DebianNet::remove_service called with empty argument\n";
          return(-1);
     }
+    unless (defined($pattern)) { $pattern = ''; }
 
-    if (((&scan_entries("$service") > 1) or (&scan_entries("$sep$service") > 1))
+    if (((&scan_entries("$service", $pattern) > 1) or (&scan_entries("$sep$service", $pattern) > 1))
         and (not defined($multi))) {
         set("update-inetd/ask-remove-entries", "false");
         fset("update-inetd/ask-remove-entries", "seen", "false");
@@ -172,7 +209,7 @@ sub remove_service {
     open(ICREAD, "$inetdcf");
     RLOOP: while(<ICREAD>) {
         chomp;
-        unless (/^$service\s+/ or /^$sep$service\s+/) {
+        if (not((/^$service\s+/ or /^$sep$service\s+/) and /$pattern/)) {
             print $ICWRITE "$_\n";
         } else {
             &printv("Removing line: \`$_'\n");
@@ -305,7 +342,7 @@ sub wakeup_inetd {
         chomp($pid);
         if (open(C,sprintf("/proc/%d/stat",$pid))) {
             $_=<C>;
-            if (m/^\d+ \(inetd\)/) {
+            if (m/^\d+ \((rl|inetutils-)?inetd\)/) {
                 &printv("About to send SIGHUP to inetd (pid: $pid)\n");
                 unless ($fake_invocation) {
                     kill(1,$pid);
